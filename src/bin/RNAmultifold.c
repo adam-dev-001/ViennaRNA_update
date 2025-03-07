@@ -51,6 +51,7 @@
 #include "parallel_helpers.h"
 
 
+/* Extend the options structure with a new parameter for maximum interacting strands */
 struct options {
   int             filename_full;
   char            *filename_delim;
@@ -86,6 +87,8 @@ struct options {
   int             keep_order;
   unsigned int    next_record_number;
   vrna_ostream_t  output_queue;
+
+  int             max_interacting_strands; /* New: if > 0, use this value instead of vc->strands */
 };
 
 
@@ -188,6 +191,8 @@ init_default_options(struct options *opt)
   opt->keep_order         = 1;
   opt->next_record_number = 0;
   opt->output_queue       = NULL;
+
+  opt->max_interacting_strands = 0; /* Default: use all available strands */
 }
 
 
@@ -248,6 +253,10 @@ main(int  argc,
    */
   if (RNAmultifold_cmdline_parser(argc, argv, &args_info) != 0)
     exit(1);
+
+  /* New: process max interacting strands parameter (assume gengetopt creates max_strands_given and max_strands_arg) */
+  if (args_info.max_strands_given)
+    opt.max_interacting_strands = args_info.max_strands_arg;
 
   /* prepare logging system and verbose mode */
   ggo_log_settings(args_info, opt.verbose);
@@ -583,6 +592,21 @@ process_record(struct record_data *record)
 
   n = vc->length;
 
+  /* Determine effective number of strands to use */
+  int effective_strands;
+  if (opt->max_interacting_strands > 0) {
+    if (opt->max_interacting_strands > vc->strands) {
+      vrna_log_warning("Specified max interacting strands (%d) exceeds available strands (%d). Using %d.",
+                       opt->max_interacting_strands, vc->strands, vc->strands);
+      effective_strands = vc->strands;
+    } else {
+      effective_strands = opt->max_interacting_strands;
+    }
+  } else {
+    effective_strands = vc->strands;
+  }
+  size_t eff_strands = (size_t) effective_strands;
+
   /* retrieve string stream bound to stdout, 6*length should be enough memory to start with */
   o_stream->data = vrna_cstr(6 * n, stdout);
   /* retrieve string stream bound to stderr for any info messages */
@@ -723,11 +747,11 @@ process_record(struct record_data *record)
         exit(EXIT_FAILURE);
       }
 
-      concentrations = read_concentrations(fp, vc->strands);
+      concentrations = read_concentrations(fp, eff_strands);
       fclose(fp);
     } else {
       printf("Please enter concentrations [mol/l]\n format: ConcA ConcB\n return to end\n");
-      concentrations = read_concentrations(stdin, vc->strands);
+      concentrations = read_concentrations(stdin, eff_strands);
     }
   }
 
@@ -864,8 +888,8 @@ process_record(struct record_data *record)
     }
 
     if (opt->doT) {
-      /* generate all complexes */
-      size_t        max_interacting_strands = vc->strands;
+      /* generate all complexes using the effective number of strands */
+      size_t        max_interacting_strands = eff_strands;
 
       unsigned int  ***complexes = (unsigned int ***)vrna_alloc(
         sizeof(unsigned int **) * max_interacting_strands);
@@ -879,7 +903,7 @@ process_record(struct record_data *record)
         size_t num_complexes = 0;
 
         /* enumerate all complexes of current size */
-        complexes[k] = vrna_n_multichoose_k(vc->strands, k);
+        complexes[k] = vrna_n_multichoose_k(eff_strands, k);
 
         /* count number of complexes of current size */
         for (; complexes[k][num_complexes] != NULL; num_complexes++);
@@ -894,7 +918,7 @@ process_record(struct record_data *record)
         for (size_t c_cnt = 0; c_cnt < num_complexes; c_cnt++) {
           if (opt->verbose) {
             vrna_strcat_printf(&verbose_line,
-                               "Complex %u/%u (size %d) ",
+                               "Complex %u/%lu (size %lu) ",
                                c_cnt + 1,
                                num_complexes, k);
           }
@@ -902,17 +926,14 @@ process_record(struct record_data *record)
           /* Now, enumerate all non-cyclic permutations for current complex */
 
           /* first, compose a list of species counts */
-          unsigned int  *species =
-            (unsigned int *)vrna_alloc(sizeof(unsigned int) * (k + 1));
-          unsigned int  *species_count = (unsigned int *)vrna_alloc(
-            sizeof(unsigned int) * vc->strands);
-          unsigned int  *mapping = (unsigned int *)vrna_alloc(
-            sizeof(unsigned int) * vc->strands);
+          unsigned int  *species = (unsigned int *)vrna_alloc(sizeof(unsigned int) * (k + 1));
+          unsigned int  *species_count = (unsigned int *)vrna_alloc(sizeof(unsigned int) * eff_strands);
+          unsigned int  *mapping = (unsigned int *)vrna_alloc(sizeof(unsigned int) * eff_strands);
           size_t        known_species = 0;
           for (size_t kk = 0; kk < k; kk++)
             species_count[complexes[k][c_cnt][kk]]++;
 
-          for (size_t kk = 0; kk < vc->strands; kk++) {
+          for (size_t kk = 0; kk < eff_strands; kk++) {
             if (species_count[kk] > 0) {
               mapping[known_species]  = kk;
               species[known_species]  = species_count[kk];
@@ -959,7 +980,7 @@ process_record(struct record_data *record)
             }
 
             /* for now, do not compute base pair probs */
-            int                   bpp_comp = opt->md.compute_bpp;
+            int bpp_comp = opt->md.compute_bpp;
             opt->md.compute_bpp = 0;
 
             /* compute MFE and PF for current permutation */
@@ -1002,7 +1023,7 @@ process_record(struct record_data *record)
 
       vrna_cstr_printf_comment(o_stream->data, "Free Energies:");
 
-      /* construct ASCII complex strings in reverse size order, i.e. larges complexes first */
+      /* construct ASCII complex strings in reverse size order, i.e. largest complexes first */
       char  *monomer_string       = NULL;
       char  *complex_string       = NULL;
       char  *dG_string            = NULL;
@@ -1052,7 +1073,7 @@ process_record(struct record_data *record)
 
       /* concentration computations */
       if (opt->doC) {
-        size_t  num_strands = vc->strands;
+        size_t  num_strands = eff_strands;
 
         /* count number of true complexes */
         size_t  num_true_complexes = 0;
@@ -1075,7 +1096,7 @@ process_record(struct record_data *record)
             curr_complex++;
           }
 
-        /* create F_complexes and F_monomer arrays to compute equilibrium constants K */
+        /* create F_complexes and F_monomers arrays to compute equilibrium constants K */
         double  *equilibrium_constants_complexes;
         double  *F_monomers   = (double *)vrna_alloc(sizeof(double) * num_strands);
         double  *F_complexes  = (double *)vrna_alloc(sizeof(double) * num_true_complexes);
@@ -1159,7 +1180,6 @@ process_record(struct record_data *record)
         }
 
         free(cc);
-        free(concentrations);
         free(equilibrium_constants_complexes);
         free(F_monomers);
         free(F_complexes);
@@ -1183,131 +1203,6 @@ process_record(struct record_data *record)
       dG_complexes  += 1;
       free(complexes);
       free(dG_complexes);
-#if 0
-      /* AA */
-      char                  *seq_AA = vrna_strdup_printf("%s&%s",
-                                                         vc->nucleotides[0].string,
-                                                         vc->nucleotides[0].string);
-
-      int                   bpp_comp = opt->md.compute_bpp;
-      opt->md.compute_bpp = 0;
-      vrna_fold_compound_t  *fc_AA = vrna_fold_compound(seq_AA, &(opt->md), VRNA_OPTION_DEFAULT);
-
-      double                mfe_AA = vrna_mfe(fc_AA, NULL);
-
-      vrna_exp_params_rescale(fc_AA, &mfe_AA);
-
-      dG_AA = vrna_pf_multimer(fc_AA, NULL);
-
-      free(seq_AA);
-      vrna_fold_compound_free(fc_AA);
-
-      /* BB */
-      char                  *seq_BB = vrna_strdup_printf("%s&%s",
-                                                         vc->nucleotides[1].string,
-                                                         vc->nucleotides[1].string);
-
-      vrna_fold_compound_t  *fc_BB = vrna_fold_compound(seq_BB, &(opt->md), VRNA_OPTION_DEFAULT);
-
-      double                mfe_BB = vrna_mfe(fc_BB, NULL);
-
-      vrna_exp_params_rescale(fc_BB, &mfe_BB);
-
-      dG_BB = vrna_pf_multimer(fc_BB, NULL);
-
-      free(seq_BB);
-      vrna_fold_compound_free(fc_BB);
-
-      opt->md.compute_bpp = bpp_comp;
-
-      FLT_OR_DBL *F_monomers = vrna_pf_substrands(vc, 1);
-
-      vrna_cstr_printf_comment(o_stream->data, "Free Energies:");
-      vrna_cstr_printf_thead(o_stream->data, "AB\t\tAA\t\tBB\t\tA\t\tB");
-      vrna_cstr_printf_tbody(o_stream->data,
-                             "%.6f\t%6f\t%6f\t%6f\t%6f",
-                             dG,
-                             dG_AA,
-                             dG_BB,
-                             F_monomers[0],
-                             F_monomers[1]);
-
-      if (opt->doC) {
-        double *conc_complexes, *conc_monomers;
-
-        /*
-         * construct association matrix A(a,k) that for each complex
-         * k stores the number of strands a the complex is composed of
-         */
-        unsigned int **A = (unsigned int **)vrna_alloc(sizeof(unsigned int *) * vc->strands);
-        for (size_t a = 0; a < vc->strands; a++)
-          A[a] = (unsigned int *)vrna_alloc(sizeof(unsigned int) * 3);
-
-        A[0][0] = 1;  /* 1x strand 0 in complex 0, aka. AB */
-        A[0][1] = 2;  /* 2x strand 0 in complex 1, aka. AA */
-        A[0][2] = 0;  /* 0x strand 0 in complex 2, aka. BB */
-
-        A[1][0] = 1;  /* 1x strand 1 in complex 0, aka. AB */
-        A[1][1] = 0;  /* 0x strand 1 in complex 1, aka. AA */
-        A[1][2] = 2;  /* 2x strand 1 in complex 2, aka. BB */
-
-        double *dG_complexes, *dG_strands, *equilibrium_constants_complex;
-
-        dG_complexes    = (double *)vrna_alloc(sizeof(double) * 3);
-        dG_strands      = (double *)vrna_alloc(sizeof(double) * 2);
-        dG_complexes[0] = dG;
-        dG_complexes[1] = dG_AA;
-        dG_complexes[2] = dG_BB;
-        dG_strands[0]   = F_monomers[0];
-        dG_strands[1]   = F_monomers[1];
-
-        equilibrium_constants_complex = vrna_equilibrium_constants((const double *)dG_complexes,
-                                                                   (const double *)dG_strands,
-                                                                   (const unsigned int **)A,
-                                                                   kT,
-                                                                   2,
-                                                                   3);
-
-        /* count number of concentration computations */
-        size_t num_conc = 0;
-        for (; concentrations[(num_conc * vc->strands)] != 0.; num_conc++);
-
-        vrna_cstr_printf_thead(o_stream->data,
-                               "Initial concentrations\t\trelative Equilibrium concentrations\n"
-                               "A\t\tB\t\tAB\t\tAA\t\tBB\t\tA\t\tB");
-
-        double *cc = (double *)vrna_alloc(sizeof(double) * 2);
-
-        for (size_t c_i = 0; c_i < num_conc; c_i++) {
-          cc[0] = concentrations[(c_i * vc->strands)];
-          cc[1] = concentrations[(c_i * vc->strands) + 1];
-
-          double  c_start_A = cc[0];
-          double  c_start_B = cc[1];
-
-          double  tot = c_start_A + c_start_B;
-
-          conc_complexes = vrna_equilibrium_conc(equilibrium_constants_complex,
-                                                 cc,
-                                                 (const unsigned int **)A,
-                                                 vc->strands,
-                                                 3);
-
-
-          vrna_cstr_printf_tbody(o_stream->data,
-                                 "%-10g\t%-10g\t%.5f \t%.5f \t%.5f \t%.5f \t%.5f",
-                                 c_start_A,
-                                 c_start_B,
-                                 conc_complexes[0] / tot,
-                                 conc_complexes[1] / tot,
-                                 conc_complexes[2] / tot,
-                                 cc[0] / tot,
-                                 cc[1] / tot);
-        }
-      }
-
-      free(F_monomers);
-#endif
     }
 
     free(prAB);
